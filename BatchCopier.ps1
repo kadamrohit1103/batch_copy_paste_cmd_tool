@@ -2,15 +2,17 @@
 .SYNOPSIS
     Batch File Copier
     Copies files based on a CSV mapping.
+    Supports copying from within ZIP archives.
 
 .DESCRIPTION
     Reads a CSV file to copy files from Source to Destination.
     Handles conflict resolution by appending numbers.
     Supports Dry Run and Undo.
+    Can extract specific files from Zip archives if the source path points inside one.
 
 .PARAMETER inputfile
     Path to the .csv file.
-    Col 1: Source Full Path
+    Col 1: Source Full Path (can be inside a zip, e.g. "C:\data.zip\folder\file.txt")
     Col 2: Destination Directory
     Col 3: (Optional) New Filename
 
@@ -29,6 +31,9 @@ param(
 
 $ErrorActionPreference = "Stop"
 $LogFile = "copy_log.json" 
+
+# Load Zip Assembly
+Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 # --- Helper Functions ---
 
@@ -54,22 +59,54 @@ function Get-UniqueFilename ($dir, $filename, $occupiedPaths) {
 function Read-CsvData {
     param($Path)
     try {
-        # Read CSV without headers to treat as Index 0, 1, 2
-        # We manually parse lines to be robust against "header or no header" ambiguity if possible,
-        # but Import-Csv -Header is safest to normalize.
         $headers = "Source","Dest","NewName"
         $data = Import-Csv $Path -Header $headers
-        
-        # If the first row looks like a header (e.g. "Source Path" or similar), we might skip it.
-        # Simple heuristic: If "Source" path doesn't exist and looks like text, skip.
-        # But user might have headers. Let's just assume valid data starts from row 2 if row 1 is invalid?
-        # Actually, let's keep it simple: ALL rows are processed. If row 1 fails validation, it's skipped.
         return $data
     }
     catch {
         Write-ErrorMsg "Failed to read CSV."
         return @()
     }
+}
+
+function Resolve-SourcePath ($path) {
+    # Returns @{ Type="File"; Path=... } or @{ Type="Zip"; ZipPath=...; InnerPath=... }
+    
+    # 1. Check if direct file exists
+    if (Test-Path -Path $path -PathType Leaf) {
+        return @{ Type="File"; Path=$path }
+    }
+
+    # 2. Check if it's inside a zip
+    # Traverse up looking for a .zip file
+    $curr = $path
+    $inner = @()
+    
+    while (-not [string]::IsNullOrEmpty($curr) -and $curr -ne [System.IO.Path]::GetPathRoot($curr)) {
+        if ((Test-Path -Path $curr -PathType Leaf) -and ($curr -match "\.zip$")) {
+            # Found the zip container
+            $innerPath = $inner -join "/" # Zip entries use forward slashes usually
+            
+            # Verify entry exists in zip
+            try {
+                $zip = [System.IO.Compression.ZipFile]::OpenRead($curr)
+                $entry = $zip.GetEntry($innerPath)
+                $zip.Dispose()
+                
+                if ($entry) {
+                    return @{ Type="Zip"; ZipPath=$curr; InnerPath=$innerPath }
+                }
+            } catch {
+                # Zip error, ignore
+            }
+        }
+        
+        # Move up
+        $inner = @([System.IO.Path]::GetFileName($curr)) + $inner
+        $curr = [System.IO.Path]::GetDirectoryName($curr)
+    }
+
+    return $null
 }
 
 function Save-Log {
@@ -111,8 +148,6 @@ function Undo-Last {
             } catch {
                 Write-ErrorMsg "Failed to delete '$dest': $($_.Exception.Message)"
             }
-        } else {
-            Write-Warn "File not found (already gone?): $dest"
         }
     }
     
@@ -139,24 +174,23 @@ $ops = @()
 $OccupiedPaths = @()
 
 foreach ($row in $Data) {
-    $src = $row.Source
+    $rawSrc = $row.Source
     $destDir = $row.Dest
     $preferred = $row.NewName
 
-    if ([string]::IsNullOrWhiteSpace($src)) { continue }
+    if ([string]::IsNullOrWhiteSpace($rawSrc)) { continue }
     
-    # Check Source
-    if (-not (Test-Path $src)) {
-        # Check if it was a header row?
-        # If $src is "Source Path" or similar, just skip silently or warn?
-        # Let's warn.
-        Write-Warn "Source not found: '$src'. Skipping."
+    # 1. Resolve Source
+    $srcInfo = Resolve-SourcePath -path $rawSrc
+    
+    if (-not $srcInfo) {
+        Write-Warn "Source not found: '$rawSrc'. Skipping."
         continue
     }
     
-    # Prepare Dest
+    # 2. Check/Make Dest Dir
     if ([string]::IsNullOrWhiteSpace($destDir)) {
-        Write-Warn "Destination missing for '$src'. Skipping."
+        Write-Warn "No destination for '$rawSrc'."
         continue
     }
     
@@ -170,23 +204,48 @@ foreach ($row in $Data) {
         }
     }
     
-    # Resolution of Filename
-    $finalName = if (-not [string]::IsNullOrWhiteSpace($preferred)) { $preferred } else { [System.IO.Path]::GetFileName($src) }
+    # 3. Determine Filename
+    $baseName = ""
+    if ($srcInfo.Type -eq "File") {
+        $baseName = [System.IO.Path]::GetFileName($srcInfo.Path)
+    } else {
+        # Zip entry might contain slashes "folder/file.txt" -> "file.txt"
+        $baseName = [System.IO.Path]::GetFileName($srcInfo.InnerPath)
+    }
     
-    # Conflict Resolution
+    $finalName = if (-not [string]::IsNullOrWhiteSpace($preferred)) { $preferred } else { $baseName }
+    
+    # 4. Conflict Resolution
     $finalName = Get-UniqueFilename -dir $destDir -filename $finalName -occupiedPaths $OccupiedPaths
     $fullDestPath = Join-Path $destDir $finalName
     
-    # Action
+    # 5. Execute Copy/Extract
     if ($dryrun) {
-        Write-Host "[PREVIEW] Copy '$src' -> '$fullDestPath'" -ForegroundColor Cyan
+        if ($srcInfo.Type -eq "file") {
+            Write-Host "[PREVIEW] Copy '$($srcInfo.Path)' -> '$fullDestPath'" -ForegroundColor Cyan
+        } else {
+            Write-Host "[PREVIEW] Extract '$($srcInfo.ZipPath) :: $($srcInfo.InnerPath)' -> '$fullDestPath'" -ForegroundColor Cyan
+        }
     } else {
         try {
-            Copy-Item -LiteralPath $src -Destination $fullDestPath -Force
-            Write-Success "Copied to '$fullDestPath'"
-            $ops += @{ source = $src; destination = $fullDestPath }
+            if ($srcInfo.Type -eq "File") {
+                Copy-Item -LiteralPath $srcInfo.Path -Destination $fullDestPath -Force
+                Write-Success "Copied: $finalName"
+            } else {
+                # Zip Extract
+                $zip = [System.IO.Compression.ZipFile]::OpenRead($srcInfo.ZipPath)
+                $entry = $zip.GetEntry($srcInfo.InnerPath)
+                if ($entry) {
+                    [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $fullDestPath, $true)
+                    Write-Success "Extracted: $finalName"
+                } else {
+                    Write-ErrorMsg "Zip entry missing during extract: $($srcInfo.InnerPath)"
+                }
+                $zip.Dispose()
+            }
+            $ops += @{ source = $rawSrc; destination = $fullDestPath }
         } catch {
-            Write-ErrorMsg "Failed to copy: $($_.Exception.Message)"
+            Write-ErrorMsg "Failed to process '$rawSrc': $($_.Exception.Message)"
         }
     }
     
