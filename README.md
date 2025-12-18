@@ -32,3 +32,6 @@ D:\Docs\notes.txt,D:\Backup\Docs,
 ### Behaviors
 1.  **Auto-Renaming**: If you copy `notes.txt` to a folder that already has `notes.txt`, the tool automatically saves it as `notes_1.txt` (then `notes_2.txt`, etc.).
 2.  **Optional Renaming**: If you provide a name in Column 3 (e.g., `final_report.pdf`), it uses that name instead of the original.
+3.  **Zip Extraction**: You can copy a file *from inside a zip* by specifying the path.
+    *   Example: `D:\Archive.zip\folder\photo.jpg`
+    *   The tool detects that `D:\Archive.zip` is a file and extracts `folder\photo.jpg` from it.
